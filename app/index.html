@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ProtoPCB</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="app-header">
+  <a class="brand" href="../index.html">ProtoPCB</a>
+</header>
+
+<main id="view-root" class="view-root"></main>
+
+<script>
+  // opencv.js's WASM runtime finishes initializing asynchronously after the script tag loads;
+  // app.js awaits window.cvReadyPromise before touching any cv.* call.
+  window.cvReadyPromise = new Promise((resolve) => {
+    window.Module = { onRuntimeInitialized: resolve };
+  });
+</script>
+<script src="https://docs.opencv.org/4.9.0/opencv.js"></script>
+<script type="module" src="app.js"></script>
+</body>
+</html>

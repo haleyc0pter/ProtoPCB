@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>ProtoPCB JS spike (Phase 1 validation)</title>
+<style>
+  body { font-family: sans-serif; background: #111; color: #eee; }
+  .row { display: flex; gap: 20px; flex-wrap: wrap; }
+  .card { background: #222; padding: 10px; border-radius: 8px; }
+  canvas, img { max-width: 480px; border: 1px solid #444; background: white; }
+  #status { white-space: pre-wrap; font-family: monospace; background: #000; padding: 10px; }
+</style>
+</head>
+<body>
+<h1>Phase 1 validation: app/lib/kicad renderer vs kicad-cli ground truth</h1>
+<div class="row">
+  <div class="card">
+    <h3>JS-rendered F.Cu (app/lib/kicad)</h3>
+    <canvas id="rendered-fcu"></canvas>
+  </div>
+  <div class="card">
+    <h3>kicad-cli ground truth (traces.png)</h3>
+    <img id="truth-fcu" src="/spike/sample-board/traces.png" />
+  </div>
+</div>
+<div id="status">loading...</div>
+
+<script>
+  var Module = {
+    onRuntimeInitialized() { window.cvReady = true; window.onOpenCvReady && window.onOpenCvReady(); }
+  };
+</script>
+<script src="https://docs.opencv.org/4.9.0/opencv.js"></script>
+<script type="module">
+  import { parseBoard, isBoardDoubleSided } from '/lib/kicad/board.js';
+  import { renderLayer } from '/lib/kicad/renderer.js';
+
+  const statusEl = document.getElementById('status');
+  const log = (s) => { statusEl.textContent += s + '\n'; };
+
+  window.cvReady = false;
+  let renderedCanvas;
+
+  function countContours(canvasOrImg) {
+    const cv = window.cv;
+    const src = cv.imread(canvasOrImg);
+    const gray = new cv.Mat();
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    const inv = new cv.Mat();
+    cv.bitwise_not(gray, inv);
+    const contours = new cv.MatVector();
+    const hierarchy = new cv.Mat();
+    cv.findContours(inv, contours, hierarchy, cv.RETR_TREE, cv.CHAIN_APPROX_NONE);
+    const n = contours.size();
+    src.delete(); gray.delete(); inv.delete(); contours.delete(); hierarchy.delete();
+    return n;
+  }
+
+  window.onOpenCvReady = () => {
+    log('opencv.js WASM runtime ready.');
+    tryCompare();
+  };
+
+  fetch('/spike/sample-board/ACS72x-Breakout_v11.kicad_pcb')
+    .then((r) => r.text())
+    .then((text) => {
+      log(`Fetched .kicad_pcb (${text.length} chars). Parsing with app/lib/kicad/board.js...`);
+      const board = parseBoard(text);
+      log(`Parsed ${board.footprints.length} footprints, ${board.segments.length} segments, ${board.zones.length} zones, ${board.vias.length} vias.`);
+      log(`Double-sided: ${isBoardDoubleSided(board)}`);
+      log(`Board bounds (mm): ${JSON.stringify(board.bounds)}`);
+      renderedCanvas = renderLayer(board, 'F.Cu');
+      document.getElementById('rendered-fcu').replaceWith(renderedCanvas);
+      renderedCanvas.id = 'rendered-fcu';
+      log(`Rendered F.Cu canvas: ${renderedCanvas.width}x${renderedCanvas.height}px`);
+      tryCompare();
+    })
+    .catch((e) => log('ERROR: ' + e.message + '\n' + e.stack));
+
+  function tryCompare() {
+    if (!window.cvReady || !renderedCanvas) return;
+    const renderedContours = countContours(renderedCanvas);
+    log(`opencv.js contours on JS-rendered F.Cu: ${renderedContours}`);
+
+    const img = document.getElementById('truth-fcu');
+    const onImgReady = () => {
+      const truthContours = countContours(img);
+      log(`opencv.js contours on kicad-cli ground-truth traces.png: ${truthContours}`);
+      log(`\nPhase 1 validation ${Math.abs(renderedContours - truthContours) <= 3 ? 'PASSED (close match)' : 'NEEDS REVIEW (contour counts differ significantly)'}`);
+    };
+    if (img.complete) onImgReady(); else img.onload = onImgReady;
+  }
+</script>
+</body>
+</html>

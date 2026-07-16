@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>ProtoPCB JS spike (Phase 2 circuit-match validation)</title>
+<style>
+  body { font-family: sans-serif; background: #111; color: #eee; }
+  #status { white-space: pre-wrap; font-family: monospace; background: #000; padding: 10px; font-size: 13px; }
+  #loading { display: none; align-items: center; gap: 12px; background: #222; padding: 14px 18px; border-radius: 8px; margin: 12px 0; max-width: 700px; }
+  #loading.active { display: flex; }
+  .spinner { width: 20px; height: 20px; border: 3px solid #444; border-top-color: #4caf50; border-radius: 50%; animation: spin 0.8s linear infinite; flex-shrink: 0; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #loading-bar-track { flex: 1; height: 8px; background: #444; border-radius: 4px; overflow: hidden; }
+  #loading-bar-fill { height: 100%; width: 0%; background: #4caf50; transition: width 0.15s linear; }
+  #loading-text { font-family: monospace; font-size: 13px; white-space: nowrap; }
+</style>
+</head>
+<body>
+<h1>Phase 2 validation: full CircuitMatching pipeline</h1>
+<div id="loading">
+  <div class="spinner"></div>
+  <div id="loading-bar-track"><div id="loading-bar-fill"></div></div>
+  <div id="loading-text">starting…</div>
+</div>
+<div id="status">loading...</div>
+
+<script>
+  var Module = { onRuntimeInitialized() { window.cvReady = true; } };
+</script>
+<script src="https://docs.opencv.org/4.9.0/opencv.js"></script>
+<script type="module">
+  import { parseBoard } from '/lib/kicad/board.js';
+  import { renderLayer } from '/lib/kicad/renderer.js';
+  import { parseDrillFile } from '/lib/kicad/drill.js';
+  import { parseSchematic, deriveNets, getOrderedComponentsList } from '/lib/kicad/schematic.js';
+  import { PCBBoard } from '/lib/match/pcb-board.js';
+  import { CircuitMatching } from '/lib/match/circuit-matching.js';
+
+  const statusEl = document.getElementById('status');
+  const log = (s) => { statusEl.textContent += s + '\n'; };
+
+  async function waitForCv() {
+    while (!window.cvReady) await new Promise((r) => setTimeout(r, 50));
+  }
+
+  async function main() {
+    await waitForCv();
+    log('opencv.js ready.');
+
+    const PX_PER_MM = 48;
+    const base = '/spike/sample-board/ACS72x-Breakout_v11';
+    const [pcbText, drlText, schText] = await Promise.all([
+      fetch(base + '.kicad_pcb').then((r) => r.text()),
+      fetch(base + '.drl').then((r) => r.text()),
+      fetch(base + '.kicad_sch').then((r) => r.text()),
+    ]);
+
+    const board = parseBoard(pcbText);
+    const holes = parseDrillFile(drlText);
+    const schematic = parseSchematic(schText);
+    const netArr = deriveNets(schematic).map((n) => ({ name: n.name, 'node arr': n['node arr'] }));
+    const { refArrSorted, footprintDict } = getOrderedComponentsList(schematic);
+    log(`Parsed board (${board.footprints.length} footprints), schematic (${schematic.components.length} components), ${netArr.length} nets derived.`);
+    log(`Sorted refs: ${JSON.stringify(refArrSorted)}`);
+    log(`Footprint groups: ${JSON.stringify(footprintDict)}`);
+
+    const maskCanvas = renderLayer(board, 'F.Mask', { pxPerMm: PX_PER_MM });
+    const tracesCanvas = renderLayer(board, 'F.Cu', { pxPerMm: PX_PER_MM });
+    const maskBackCanvas = renderLayer(board, 'B.Mask', { pxPerMm: PX_PER_MM });
+    const tracesBackCanvas = renderLayer(board, 'B.Cu', { pxPerMm: PX_PER_MM });
+
+    const pcbBoard = new PCBBoard(board);
+    pcbBoard.initializeViaFiles(maskCanvas, tracesCanvas, { maskBackCanvas, traceBackCanvas: tracesBackCanvas, holes });
+    log(`PCBBoard built. doubleSided=${pcbBoard.doubleSided}, boardConnectionsDict entries: ${Object.keys(pcbBoard.boardConnectionsDict).length}`);
+
+    // footprintLookup: given a footprint ID like "ACS72x-Breakout_v11:SO8", find any placed
+    // instance of that footprint on the board and return a *localized* (origin-centered) copy
+    // suitable for renderFootprint (which expects pad.pos in the footprint's own local frame).
+    function footprintLookup(footprintId) {
+      const shortName = footprintId.split(':')[1];
+      const instance = board.footprints.find((fp) => fp.name === shortName);
+      if (!instance) throw new Error('No board instance found for footprint ' + footprintId);
+      const at = instance.at;
+      return {
+        name: shortName,
+        pads: instance.pads.map((p) => ({
+          ...p,
+          pos: { x: p.boardPos.x - at.x, y: p.boardPos.y - at.y, orientation: p.boardRotation - at.rot },
+        })),
+      };
+    }
+
+    const cirM = new CircuitMatching(refArrSorted, footprintDict, netArr);
+    cirM.pcbBoard = pcbBoard;
+
+    const loadingEl = document.getElementById('loading');
+    const barFill = document.getElementById('loading-bar-fill');
+    const loadingText = document.getElementById('loading-text');
+    loadingEl.classList.add('active');
+
+    log('Running findCircuitMatch()... this may take a while (multiple components x 8 orientations each).');
+    const t0 = performance.now();
+    const result = await cirM.findCircuitMatch(footprintLookup, {
+      onProgress: ({ orientationIndex, orientationTotal, rowsDone, totalRows }) => {
+        const pct = ((orientationIndex + rowsDone / totalRows) / orientationTotal) * 100;
+        barFill.style.width = pct.toFixed(1) + '%';
+        loadingText.textContent = `orientation ${orientationIndex + 1}/${orientationTotal}, row ${rowsDone}/${totalRows}`;
+      },
+    });
+    const t1 = performance.now();
+    loadingEl.classList.remove('active');
+
+    log(`findCircuitMatch() finished in ${((t1 - t0) / 1000).toFixed(1)}s`);
+    log(`Result circuitArr has ${result.circuitArr.length} of ${netArr.length} nets.`);
+    log(`refs assigned: ${JSON.stringify(result.refs)}`);
+    for (const net of result.circuitArr) {
+      log(` - net ${net.net}: traces=${JSON.stringify(net.traces)} nodes=${JSON.stringify(net.nodes.map(n => n.node))}${net.interventions ? ' [INTERVENTION NEEDED]' : ''}`);
+    }
+  }
+
+  main().catch((e) => log('ERROR: ' + e.message + '\n' + e.stack));
+</script>
+</body>
+</html>

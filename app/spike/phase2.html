@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>ProtoPCB JS spike (Phase 2 validation)</title>
+<style>
+  body { font-family: sans-serif; background: #111; color: #eee; }
+  .row { display: flex; gap: 20px; flex-wrap: wrap; }
+  .card { background: #222; padding: 10px; border-radius: 8px; }
+  canvas, img { max-width: 300px; border: 1px solid #444; background: white; }
+  #status { white-space: pre-wrap; font-family: monospace; background: #000; padding: 10px; font-size: 13px; }
+  #loading { display: none; align-items: center; gap: 12px; background: #222; padding: 14px 18px; border-radius: 8px; margin: 12px 0; }
+  #loading.active { display: flex; }
+  .spinner { width: 20px; height: 20px; border: 3px solid #444; border-top-color: #4caf50; border-radius: 50%; animation: spin 0.8s linear infinite; flex-shrink: 0; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #loading-bar-track { flex: 1; height: 8px; background: #444; border-radius: 4px; overflow: hidden; }
+  #loading-bar-fill { height: 100%; width: 0%; background: #4caf50; transition: width 0.15s linear; }
+  #loading-text { font-family: monospace; font-size: 13px; white-space: nowrap; }
+</style>
+</head>
+<body>
+<h1>Phase 2 validation: ComponentMatching pipeline (opencv.js)</h1>
+<div class="row">
+  <div class="card"><h3>mask (F.Mask)</h3><canvas id="mask"></canvas></div>
+  <div class="card"><h3>traces (F.Cu)</h3><canvas id="traces"></canvas></div>
+  <div class="card"><h3>footprint template (C0402, F.Cu)</h3><canvas id="fp"></canvas></div>
+</div>
+<div id="loading">
+  <div class="spinner"></div>
+  <div id="loading-bar-track"><div id="loading-bar-fill"></div></div>
+  <div id="loading-text">starting…</div>
+</div>
+<div id="status">loading...</div>
+
+<script>
+  var Module = { onRuntimeInitialized() { window.cvReady = true; } };
+</script>
+<script src="https://docs.opencv.org/4.9.0/opencv.js"></script>
+<script type="module">
+  import { parseBoard, isBoardDoubleSided } from '/lib/kicad/board.js';
+  import { renderLayer, renderFootprint } from '/lib/kicad/renderer.js';
+  import { parseDrillFile } from '/lib/kicad/drill.js';
+  import { PCBBoard } from '/lib/match/pcb-board.js';
+  import { ComponentMatching } from '/lib/match/component-match.js';
+
+  const statusEl = document.getElementById('status');
+  const log = (s) => { statusEl.textContent += s + '\n'; };
+
+  async function waitForCv() {
+    while (!window.cvReady) await new Promise((r) => setTimeout(r, 50));
+  }
+
+  async function main() {
+    await waitForCv();
+    log('opencv.js ready.');
+
+    const pcbText = await fetch('/spike/sample-board/ACS72x-Breakout_v11.kicad_pcb').then((r) => r.text());
+    const drlText = await fetch('/spike/sample-board/ACS72x-Breakout_v11.drl').then((r) => r.text());
+
+    const board = parseBoard(pcbText);
+    const holes = parseDrillFile(drlText);
+    log(`Parsed board: ${board.footprints.length} footprints, ${holes.length} drill holes.`);
+
+    // Board layers and footprint templates must share the same px/mm scale for template
+    // matching to line up — 48 px/mm matches the hardcoded scale baked into getPinMapping
+    // (itself inherited from the original tool's CairoSVG scale=4/dpi=300 pipeline, ~47.24 px/mm).
+    const PX_PER_MM = 48;
+    const maskCanvas = renderLayer(board, 'F.Mask', { pxPerMm: PX_PER_MM });
+    const tracesCanvas = renderLayer(board, 'F.Cu', { pxPerMm: PX_PER_MM });
+    const maskBackCanvas = renderLayer(board, 'B.Mask', { pxPerMm: PX_PER_MM });
+    const tracesBackCanvas = renderLayer(board, 'B.Cu', { pxPerMm: PX_PER_MM });
+    document.getElementById('mask').replaceWith(maskCanvas); maskCanvas.id = 'mask';
+    document.getElementById('traces').replaceWith(tracesCanvas); tracesCanvas.id = 'traces';
+
+    const pcbBoard = new PCBBoard(board);
+    pcbBoard.initializeViaFiles(maskCanvas, tracesCanvas, { maskBackCanvas, traceBackCanvas: tracesBackCanvas, holes });
+    log(`PCBBoard built. doubleSided=${pcbBoard.doubleSided}, maskContours=${pcbBoard.maskContours.length}, traceContours=${pcbBoard.traceContours.length}`);
+    log(`boardConnectionsDict entries: ${Object.keys(pcbBoard.boardConnectionsDict).length}`);
+
+    // Find the two C0402 footprint instances (C1 and C2A0) to use as the match target.
+    const c0402Instances = board.footprints.filter((fp) => fp.name === 'C0402');
+    log(`Found ${c0402Instances.length} C0402 footprint instances on the board at: ` +
+      JSON.stringify(c0402Instances.map(fp => fp.at)));
+
+    const targetFootprint = { name: 'C0402', pads: c0402Instances[0].pads.map(p => ({ ...p, pos: p.boardPos })) };
+    // renderFootprint expects pad.pos in *local* footprint coordinates (i.e. relative to the
+    // footprint's own origin) — recompute local pos by subtracting the placement offset back out,
+    // since board.js's placeFootprint only stores boardPos (world coords).
+    const at = c0402Instances[0].at;
+    const localFootprint = {
+      name: 'C0402',
+      pads: c0402Instances[0].pads.map((p) => ({ ...p, pos: { x: p.boardPos.x - at.x, y: p.boardPos.y - at.y, orientation: p.boardRotation } })),
+    };
+
+    const fpCanvas = renderFootprint(localFootprint, 'F.Cu', { pxPerMm: PX_PER_MM });
+    document.getElementById('fp').replaceWith(fpCanvas); fpCanvas.id = 'fp';
+    log(`Rendered footprint template: ${fpCanvas.width}x${fpCanvas.height}px`);
+
+    const cm = new ComponentMatching();
+    cm.pcbBoard = pcbBoard;
+    cm.initializeFootprint(fpCanvas, localFootprint);
+    log(`Footprint initialized: numFpPads=${cm.numFpPads}`);
+
+    log('Running getMatches() (8 orientations)... this may take a moment.');
+    const loadingEl = document.getElementById('loading');
+    const barFill = document.getElementById('loading-bar-fill');
+    const loadingText = document.getElementById('loading-text');
+    loadingEl.classList.add('active');
+
+    const t0 = performance.now();
+    const matches = await cm.getMatches({
+      onProgress: ({ orientationIndex, orientationTotal, rowsDone, totalRows }) => {
+        const overallPct = ((orientationIndex + rowsDone / totalRows) / orientationTotal) * 100;
+        barFill.style.width = overallPct.toFixed(1) + '%';
+        loadingText.textContent = `orientation ${orientationIndex + 1}/${orientationTotal}, row ${rowsDone}/${totalRows} (${overallPct.toFixed(0)}%)`;
+      },
+    });
+    const t1 = performance.now();
+    loadingEl.classList.remove('active');
+    log(`getMatches() found ${matches.length} matches in ${(t1 - t0).toFixed(0)}ms`);
+
+    for (const m of matches) {
+      log(` - match at (${m.coordinates.x},${m.coordinates.y}) orientation=${m.orientation} score=${m.score.toFixed(3)} padIDs=${JSON.stringify(m.padIDs)}`);
+    }
+
+    // Cross-check: convert each real C0402 instance's board (x,y) into mask-image pixel coords
+    // using the same board-bounds mapping the renderer used, and see if any match's coordinates
+    // land near one of these (a true validation that matches correspond to real component locations).
+    const { bounds } = board;
+    for (const fp of c0402Instances) {
+      const px = (fp.at.x - bounds.minX) * PX_PER_MM;
+      const py = (fp.at.y - bounds.minY) * PX_PER_MM;
+      log(`Real C0402 instance at board (${fp.at.x},${fp.at.y}) -> expected pixel ~(${px.toFixed(0)},${py.toFixed(0)})`);
+    }
+  }
+
+  main().catch((e) => log('ERROR: ' + e.message + '\n' + e.stack));
+</script>
+</body>
+</html>
