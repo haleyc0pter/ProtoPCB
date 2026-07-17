@@ -112,6 +112,30 @@ function makeProgressPoster(id) {
   };
 }
 
+// One cached circuit-match session, keyed on the uploaded file contents. Re-running the same
+// board+schematic pair reuses the CircuitMatching instance's per-component candidate caches, so
+// "search longer" continues from previous work instead of starting over — components whose search
+// already completed cost ~0 on the re-run, and cut-short ones get re-searched with the new budget.
+let circuitSession = null;
+
+// djb2 — collisions across the handful of files a user uploads in one session are not a concern.
+function textKey(...texts) {
+  let h = 5381;
+  for (const t of texts) {
+    const s = t || '';
+    for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+    h = (h * 33) ^ 0xff;
+  }
+  return h >>> 0;
+}
+
+function disposeCircuitSession() {
+  if (!circuitSession) return;
+  circuitSession.cirM.dispose();
+  circuitSession.pcbBoard.delete();
+  circuitSession = null;
+}
+
 async function handleComponentMatch({ id, pcbText, drlText, ref, footprintId }) {
   const status = (text) => postMessage({ id, type: 'status', text });
 
@@ -124,6 +148,7 @@ async function handleComponentMatch({ id, pcbText, drlText, ref, footprintId }) 
   try {
     footprint = footprintLookup(footprintId);
   } catch {
+    pcbBoard.delete();
     postMessage(
       { id, type: 'result', data: { ref, footprintId, unavailable: true, matchCount: 0, best: null }, images: { traces: tracesBitmap } },
       [tracesBitmap],
@@ -158,29 +183,50 @@ async function handleComponentMatch({ id, pcbText, drlText, ref, footprintId }) 
     overlayMat.delete();
     transfers.push(images.overlay);
   }
+  for (const m of matches) {
+    if (m.fpContours) for (const c of m.fpContours) c.delete();
+  }
   cm.delete();
+  pcbBoard.delete();
 
   postMessage({ id, type: 'result', data, images }, transfers);
 }
 
-async function handleCircuitMatch({ id, pcbText, schText, drlText }) {
+async function handleCircuitMatch({ id, pcbText, schText, drlText, searchBudgetMs }) {
   const status = (text) => postMessage({ id, type: 'status', text });
+  const key = textKey(pcbText, schText, drlText);
 
-  status('Parsing board and schematic…');
-  const { board, pcbBoard, tracesCanvas } = prepareBoard(pcbText, drlText);
-  const tracesBitmap = tracesCanvas.transferToImageBitmap();
+  let cirM, footprintLookup, netArr, refArrSorted, tracesBitmap;
+  if (circuitSession && circuitSession.key === key) {
+    // Same files as the previous run: keep the candidate caches, re-search only what was cut
+    // short. The traces canvas can't be kept (transferToImageBitmap detaches it), so re-render
+    // it from the cached parsed board — that's milliseconds, unlike the search.
+    ({ cirM, footprintLookup, netArr, refArrSorted } = circuitSession);
+    cirM.invalidateIncompleteRefs();
+    tracesBitmap = renderLayer(circuitSession.board, 'F.Cu', { pxPerMm: PX_PER_MM }).transferToImageBitmap();
+    status(`Resuming search (keeping previous results) across ${netArr.length} nets, ${refArrSorted.length} components…`);
+  } else {
+    disposeCircuitSession();
+    status('Parsing board and schematic…');
+    const { board, pcbBoard, tracesCanvas } = prepareBoard(pcbText, drlText);
+    tracesBitmap = tracesCanvas.transferToImageBitmap();
 
-  const schematic = parseSchematic(schText);
-  const netArr = deriveNets(schematic).map((n) => ({ name: n.name, 'node arr': n['node arr'] }));
-  const { refArrSorted, footprintDict } = getOrderedComponentsList(schematic);
-  const footprintLookup = makeFootprintLookup(board);
+    const schematic = parseSchematic(schText);
+    netArr = deriveNets(schematic).map((n) => ({ name: n.name, 'node arr': n['node arr'] }));
+    const parsed = getOrderedComponentsList(schematic);
+    refArrSorted = parsed.refArrSorted;
+    footprintLookup = makeFootprintLookup(board);
 
-  status(`Searching for a circuit match across ${netArr.length} nets, ${refArrSorted.length} components…`);
+    cirM = new CircuitMatching(refArrSorted, parsed.footprintDict, netArr);
+    cirM.pcbBoard = pcbBoard;
+    circuitSession = { key, board, pcbBoard, cirM, footprintLookup, netArr, refArrSorted };
+    status(`Searching for a circuit match across ${netArr.length} nets, ${refArrSorted.length} components…`);
+  }
 
-  const cirM = new CircuitMatching(refArrSorted, footprintDict, netArr);
-  cirM.pcbBoard = pcbBoard;
-
-  const result = await cirM.findCircuitMatch(footprintLookup, { onProgress: makeProgressPoster(id) });
+  const result = await cirM.findCircuitMatch(footprintLookup, {
+    onProgress: makeProgressPoster(id),
+    ...(searchBudgetMs ? { searchBudgetMs } : {}),
+  });
 
   const data = {
     compatibility: result.compatibility,

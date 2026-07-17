@@ -13,6 +13,9 @@ const session = {
   schFileName: '',
   drlText: null,
   drlFileName: '',
+  // Doubles on every "Search longer" click; the worker keeps its candidate caches between runs
+  // of the same files, so each re-run continues where the previous one was cut off.
+  circuitBudgetMs: 240000,
 };
 
 // --- worker client -----------------------------------------------------------------------------
@@ -272,12 +275,14 @@ function renderComponentResultView(data, images) {
 
 // --- Screen 3b: circuit match (mirrors gui.py's runCircuitAnalysis -> VidCircuitDraft) ---------
 
-async function runCircuitMatchFlow() {
+async function runCircuitMatchFlow({ searchLonger = false } = {}) {
   try {
-    const loading = renderLoadingView('Running circuit match…');
+    if (searchLonger) session.circuitBudgetMs *= 2;
+    else session.circuitBudgetMs = 240000;
+    const loading = renderLoadingView(searchLonger ? 'Searching further…' : 'Running circuit match…');
     const { data, images } = await runInWorker(
       'circuitMatch',
-      { pcbText: session.pcbText, schText: session.schText, drlText: session.drlText },
+      { pcbText: session.pcbText, schText: session.schText, drlText: session.drlText, searchBudgetMs: session.circuitBudgetMs },
       { onStatus: (t) => loading.setStatus(t), onProgress: (p) => loading.onProgress(p) },
     );
     renderCircuitResultView(data, images);
@@ -299,7 +304,7 @@ function renderCircuitResultView(data, images) {
       <div class="board-view" id="board-view"></div>
       <h2 style="margin-top:24px">Nets</h2>
       <div class="net-list" id="net-list"></div>
-      <div class="actions"><button class="secondary" id="btn-restart">Start over</button></div>
+      <div class="actions" id="result-actions"><button class="secondary" id="btn-restart">Start over</button></div>
     </section>
   `);
 
@@ -315,13 +320,14 @@ function renderCircuitResultView(data, images) {
   // unmatchable (footprint truly absent) or simply missing from the nets below with no note here.
   // Conflating the two would report "this board is incompatible" when the honest answer is
   // "we don't know yet, the search needs more time."
+  const searchIncomplete = incompleteComponents.length > 0 || searchTimedOut;
   if (incompleteComponents.length > 0) {
     view.querySelector('#incomplete').innerHTML =
       `<div class="result-meta"><span class="badge warn">Search incomplete</span> ran out of time before finishing the search for: ${incompleteComponents.join(', ')}. ` +
-      `The percentage above may understate real compatibility — try again to search further (results so far are kept).</div>`;
+      `The percentage above may understate real compatibility — use "Search longer" below to continue (results so far are kept).</div>`;
   } else if (searchTimedOut) {
     view.querySelector('#incomplete').innerHTML =
-      `<div class="result-meta"><span class="badge warn">Search incomplete</span> the search ran out of time before checking every possibility. The percentage above may understate real compatibility — try again to search further.</div>`;
+      `<div class="result-meta"><span class="badge warn">Search incomplete</span> the search ran out of time before checking every possibility. The percentage above may understate real compatibility — use "Search longer" below to continue.</div>`;
   }
 
   if (unmatchableComponents.length > 0) {
@@ -350,6 +356,12 @@ function renderCircuitResultView(data, images) {
       </div>
     `);
     netList.appendChild(row);
+  }
+
+  if (searchIncomplete) {
+    const btnLonger = el('<button class="primary" id="btn-search-longer">Search longer</button>');
+    btnLonger.addEventListener('click', () => runCircuitMatchFlow({ searchLonger: true }));
+    view.querySelector('#result-actions').prepend(btnLonger);
   }
 
   view.querySelector('#btn-restart').addEventListener('click', () => renderUploadView());

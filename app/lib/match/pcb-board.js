@@ -128,22 +128,30 @@ export class PCBBoard {
     const invMaskGray = bitwiseNot(maskGray);
     const maskResult = findContours(invMaskGray, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE);
     this.maskContours = maskResult.contours;
+    maskResult.hierarchy.delete();
+    maskGray.delete();
+    invMaskGray.delete();
 
     const traceGray = toGray(this.pcbMat);
     const traceResult = findContours(traceGray, cv.RETR_TREE, cv.CHAIN_APPROX_NONE);
     this.traceContours = traceResult.contours;
     this.traceHierarchy = traceResult.hierarchy;
+    traceGray.delete();
 
     if (this.doubleSided) {
       const maskBackGray = toGray(this.maskMatBack);
       const invMaskBackGray = bitwiseNot(maskBackGray);
       const maskBackResult = findContours(invMaskBackGray, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE);
       this.maskBackContours = maskBackResult.contours;
+      maskBackResult.hierarchy.delete();
+      maskBackGray.delete();
+      invMaskBackGray.delete();
 
       const traceBackGray = toGray(this.pcbMatBack);
       const traceBackResult = findContours(traceBackGray, cv.RETR_TREE, cv.CHAIN_APPROX_NONE);
       this.traceBackContours = traceBackResult.contours;
       this.traceBackHierarchy = traceBackResult.hierarchy;
+      traceBackGray.delete();
 
       if (holes.length > 0) {
         this.createViasProfile(holes);
@@ -155,6 +163,16 @@ export class PCBBoard {
     }
   }
 
+  // Frees every WASM Mat this board holds. Required whenever a PCBBoard is discarded — the worker
+  // is long-lived now, so a board's Mats (several full-board images plus every contour) would
+  // otherwise stay allocated forever after the user switches to a different board.
+  delete() {
+    const mats = [this.pcbMat, this.maskMat, this.pcbMatBack, this.maskMatBack, this.traceHierarchy, this.traceBackHierarchy];
+    for (const m of mats) if (m) m.delete();
+    const contourLists = [this.maskContours, this.traceContours, this.maskBackContours, this.traceBackContours];
+    for (const list of contourLists) if (list) for (const c of list) c.delete();
+  }
+
   // mirrors create_profile (single-sided, or double-sided without a usable drill file)
   createProfile() {
     const traceGray = toGray(this.pcbMat);
@@ -163,6 +181,8 @@ export class PCBBoard {
     const frontPadMap = genPadMap(this.maskContours);
     const frontTraceMap = connectedPads(frontPadMap, this.traceContours, this.traceHierarchy, invGray);
     this.frontPadMap = frontPadMap;
+    traceGray.delete();
+    invGray.delete();
 
     const boardConnectionsDict = {};
     let traceIndex = 0;
@@ -177,6 +197,8 @@ export class PCBBoard {
       const backPadMap = genPadMap(this.maskBackContours);
       const backTraceMap = connectedPads(backPadMap, this.traceBackContours, this.traceBackHierarchy, invBackGray);
       this.backPadMap = backPadMap;
+      traceBackGray.delete();
+      invBackGray.delete();
 
       for (const [bTrace, pads] of Object.entries(backTraceMap)) {
         boardConnectionsDict[traceIndex] = { frontTraces: [], backTraces: [Number(bTrace)], frontPads: [], backPads: pads };
@@ -328,6 +350,10 @@ export class PCBBoard {
     this.boardConnectionsDict = boardConnectionsDict;
     this.frontPadMap = frontPadMap;
     this.backPadMap = backPadMap;
+    traceGray.delete();
+    invGray.delete();
+    traceBackGray.delete();
+    invBackGray.delete();
   }
 
   // mirrors integrate_trace_cuts

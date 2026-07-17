@@ -41,6 +41,29 @@ export class CircuitMatching {
     return null;
   }
 
+  _freeCandidatesForRef(ref) {
+    for (const match of this.cmDict[ref] || []) {
+      if (match.fpContours) for (const c of match.fpContours) c.delete();
+    }
+    delete this.cmDict[ref];
+    delete this.cmData[ref];
+  }
+
+  // Forgets cached candidate lists for refs whose search was cut short by an earlier deadline, so
+  // a follow-up run with a fresh budget genuinely re-searches them instead of trusting the
+  // truncated list — this is what makes "try again to search further" mean something. Refs whose
+  // search completed keep their cache (re-searching those would find the same answer slower).
+  invalidateIncompleteRefs() {
+    for (const ref of this.incompleteRefs) this._freeCandidatesForRef(ref);
+    this.incompleteRefs.clear();
+  }
+
+  // Frees every cached candidate's Mats — required when discarding this instance, since the
+  // worker owning it is long-lived and WASM heap memory doesn't get garbage-collected.
+  dispose() {
+    for (const ref of Object.keys(this.cmDict)) this._freeCandidatesForRef(ref);
+  }
+
   // Builds (and caches) the candidate ComponentMatch list for one ref, mirroring the repeated
   // cm_dict-cache-then-ComponentMatching.get_matches() pattern used throughout get_matches_fifo.
   //
