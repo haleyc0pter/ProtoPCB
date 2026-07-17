@@ -77,9 +77,12 @@ export function renderLayer(board, targetLayer, { pxPerMm = 20 } = {}) {
   const widthMm = bounds.maxX - bounds.minX;
   const heightMm = bounds.maxY - bounds.minY;
 
-  const canvas = document.createElement('canvas');
-  canvas.width = Math.max(1, Math.ceil(widthMm * pxPerMm));
-  canvas.height = Math.max(1, Math.ceil(heightMm * pxPerMm));
+  // OffscreenCanvas when running inside a Web Worker (no `document` there), DOM canvas otherwise.
+  const w = Math.max(1, Math.ceil(widthMm * pxPerMm));
+  const h = Math.max(1, Math.ceil(heightMm * pxPerMm));
+  const canvas = typeof document !== 'undefined' ? document.createElement('canvas') : new OffscreenCanvas(w, h);
+  canvas.width = w;
+  canvas.height = h;
   const ctx = canvas.getContext('2d');
   ctx.fillStyle = 'white';
   ctx.fillRect(0, 0, canvas.width, canvas.height);

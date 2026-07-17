@@ -1,15 +1,9 @@
-// ProtoPCB web app controller — replaces Code/gui.py's Tkinter shell. Business logic lives in
-// lib/kicad (parsing/rendering) and lib/match (component/net/circuit matching); this file is
-// purely the view layer: render a screen, wire up its events, move to the next screen.
-import { parseBoard, isBoardDoubleSided } from './lib/kicad/board.js';
-import { renderLayer, renderFootprint } from './lib/kicad/renderer.js';
-import { parseDrillFile } from './lib/kicad/drill.js';
-import { parseSchematic, deriveNets, getOrderedComponentsList, getSymbolByRef } from './lib/kicad/schematic.js';
-import { PCBBoard } from './lib/match/pcb-board.js';
-import { ComponentMatching } from './lib/match/component-match.js';
-import { CircuitMatching } from './lib/match/circuit-matching.js';
+// ProtoPCB web app controller — replaces Code/gui.py's Tkinter shell. This file is purely the
+// view layer: render a screen, wire up its events, move to the next screen. The matching pipeline
+// (parsing, rendering, opencv.js) runs entirely inside worker.js — the main thread never loads
+// opencv.js, and background-tab timer throttling can't stretch a running search.
+import { parseSchematic, getOrderedComponentsList } from './lib/kicad/schematic.js';
 
-const PX_PER_MM = 48;
 const root = document.getElementById('view-root');
 
 const session = {
@@ -21,8 +15,38 @@ const session = {
   drlFileName: '',
 };
 
-async function waitForOpenCv() {
-  await window.cvReadyPromise;
+// --- worker client -----------------------------------------------------------------------------
+
+let worker = null;
+let nextRequestId = 1;
+
+function getWorker() {
+  if (!worker) worker = new Worker('worker.js', { type: 'module' });
+  return worker;
+}
+
+// One in-flight request at a time is all the UI can start (every flow replaces the screen), so a
+// plain per-request listener keyed on id is enough — no queue needed.
+function runInWorker(type, payload, { onStatus, onProgress } = {}) {
+  const id = nextRequestId++;
+  const w = getWorker();
+  return new Promise((resolve, reject) => {
+    const onMessage = (event) => {
+      const msg = event.data;
+      if (msg.id !== id) return;
+      if (msg.type === 'status') onStatus && onStatus(msg.text);
+      else if (msg.type === 'progress') onProgress && onProgress(msg.p);
+      else if (msg.type === 'result') {
+        w.removeEventListener('message', onMessage);
+        resolve(msg);
+      } else if (msg.type === 'error') {
+        w.removeEventListener('message', onMessage);
+        reject(new Error(msg.message));
+      }
+    };
+    w.addEventListener('message', onMessage);
+    w.postMessage({ id, type, ...payload });
+  });
 }
 
 function el(html) {
@@ -33,6 +57,16 @@ function el(html) {
 
 function setView(node) {
   root.replaceChildren(node);
+}
+
+function bitmapToCanvas(bitmap, className = '') {
+  const canvas = document.createElement('canvas');
+  canvas.width = bitmap.width;
+  canvas.height = bitmap.height;
+  if (className) canvas.className = className;
+  canvas.getContext('2d').drawImage(bitmap, 0, 0);
+  bitmap.close();
+  return canvas;
 }
 
 // --- Screen 1: upload (mirrors gui.py's StartPage2) -------------------------------------------
@@ -142,19 +176,6 @@ function renderLoadingView(title) {
   };
 }
 
-// opencv.js's embind layer throws raw WASM exception pointers (a bare number) for C++-side
-// errors instead of a normal Error — cv.exceptionFromPtr decodes those into a readable message.
-function describeError(err) {
-  if (typeof err === 'number' && typeof cv !== 'undefined' && cv.exceptionFromPtr) {
-    try {
-      return cv.exceptionFromPtr(err).msg;
-    } catch {
-      return `Unrecognized native error code: ${err}`;
-    }
-  }
-  return (err && err.stack) || String(err);
-}
-
 function renderErrorView(err) {
   console.error(err);
   const view = el(`
@@ -164,67 +185,18 @@ function renderErrorView(err) {
       <div class="actions"><button class="secondary" id="btn-restart">Start over</button></div>
     </section>
   `);
-  view.querySelector('.error-box').textContent = describeError(err);
+  view.querySelector('.error-box').textContent = (err && err.message) || String(err);
   view.querySelector('#btn-restart').addEventListener('click', () => renderUploadView());
   setView(view);
 }
 
-// --- Shared board/schematic preparation --------------------------------------------------------
-
-async function prepareBoard() {
-  const board = parseBoard(session.pcbText);
-  const holes = session.drlText ? parseDrillFile(session.drlText) : [];
-
-  const maskCanvas = renderLayer(board, 'F.Mask', { pxPerMm: PX_PER_MM });
-  const tracesCanvas = renderLayer(board, 'F.Cu', { pxPerMm: PX_PER_MM });
-
-  const pcbBoard = new PCBBoard(board);
-  if (isBoardDoubleSided(board)) {
-    const maskBackCanvas = renderLayer(board, 'B.Mask', { pxPerMm: PX_PER_MM });
-    const tracesBackCanvas = renderLayer(board, 'B.Cu', { pxPerMm: PX_PER_MM });
-    pcbBoard.initializeViaFiles(maskCanvas, tracesCanvas, { maskBackCanvas, traceBackCanvas: tracesBackCanvas, holes });
-  } else {
-    pcbBoard.initializeViaFiles(maskCanvas, tracesCanvas, { holes });
-  }
-
-  return { board, pcbBoard, tracesCanvas };
-}
-
-// footprintLookup: given a footprint ID ("<lib>:<name>"), find a placed instance of that
-// footprint on the *candidate* board and return a localized (origin-centered) copy suitable for
-// renderFootprint — there is no separate footprint library to browse in this browser-only tool,
-// only whatever footprints already exist on the uploaded board.
-// .kicad_pcb files vary on whether a footprint's name includes its library ("Package_SO:SOIC-8_...",
-// the normal native-KiCad form) or is bare ("C0402", seen on Eagle-imported boards) — compare by
-// the part after the last colon on both sides so either form matches the other.
-function shortFootprintName(name) {
-  return name.split(':').pop();
-}
-
-function makeFootprintLookup(board) {
-  return (footprintId) => {
-    const shortName = shortFootprintName(footprintId);
-    const instance = board.footprints.find((fp) => shortFootprintName(fp.name) === shortName);
-    if (!instance) throw new Error(`No matching footprint "${shortName}" found on the uploaded board.`);
-    const at = instance.at;
-    return {
-      name: shortName,
-      pads: instance.pads.map((p) => ({
-        ...p,
-        pos: { x: p.boardPos.x - at.x, y: p.boardPos.y - at.y, orientation: p.boardRotation - at.rot },
-      })),
-    };
-  };
-}
-
 // --- Screen 3a: component selector (mirrors gui.py's ComponentSelectorPage) --------------------
 
-async function runComponentSelectorFlow() {
+function runComponentSelectorFlow() {
   try {
-    await waitForOpenCv();
-    const loading = renderLoadingView('Reading schematic…');
+    // Pure text parsing — fast enough to stay on the main thread.
     const schematic = parseSchematic(session.schText);
-    const { refArrSorted, footprintDict } = getOrderedComponentsList(schematic);
+    const { refArrSorted } = getOrderedComponentsList(schematic);
 
     const view = el(`
       <section>
@@ -255,71 +227,43 @@ async function runComponentSelectorFlow() {
 
 async function runComponentMatchFlow(ref, footprintId) {
   try {
-    await waitForOpenCv();
     const loading = renderLoadingView(`Matching ${ref}…`);
-    loading.setStatus('Parsing board and rendering layers…');
-
-    const { board, pcbBoard, tracesCanvas } = await prepareBoard();
-    const footprintLookup = makeFootprintLookup(board);
-
-    let footprint;
-    try {
-      footprint = footprintLookup(footprintId);
-    } catch {
-      // The uploaded board doesn't have this footprint anywhere on it — this tool can currently
-      // only search for footprints the board itself already has (no bundled standard-footprint
-      // library yet), so report that plainly instead of a stack trace.
-      renderComponentResultView(ref, [], null, tracesCanvas, {
-        unavailable: true,
-        footprintId,
-      });
-      return;
-    }
-
-    const fpCanvas = renderFootprint(footprint, 'F.Cu', { pxPerMm: PX_PER_MM });
-    const cm = new ComponentMatching();
-    cm.pcbBoard = pcbBoard;
-    cm.initializeFootprint(fpCanvas, footprint);
-
-    loading.setStatus('Searching for matches…');
-    let matches = await cm.getMatches({ onProgress: (p) => loading.onProgress(p) });
-    matches = cm.sortMatches(matches);
-    matches = cm.addTracesDataToMatches(matches);
-
-    renderComponentResultView(ref, matches, cm, tracesCanvas);
+    const { data, images } = await runInWorker(
+      'componentMatch',
+      { pcbText: session.pcbText, drlText: session.drlText, ref, footprintId },
+      { onStatus: (t) => loading.setStatus(t), onProgress: (p) => loading.onProgress(p) },
+    );
+    renderComponentResultView(data, images);
   } catch (err) {
     renderErrorView(err);
   }
 }
 
-function renderComponentResultView(ref, matches, cm, tracesCanvas, { unavailable = false, footprintId = '' } = {}) {
+function renderComponentResultView(data, images) {
+  const { ref, footprintId, unavailable, matchCount, best } = data;
   const view = el(`
     <section>
       <h1>Matches for ${ref}</h1>
-      <p class="subtitle">${unavailable ? '' : `${matches.length} candidate location${matches.length === 1 ? '' : 's'} found on the board.`}</p>
+      <p class="subtitle">${unavailable ? '' : `${matchCount} candidate location${matchCount === 1 ? '' : 's'} found on the board.`}</p>
       <div class="board-view" id="board-view"></div>
       <div class="result-meta" id="match-meta"></div>
       <div class="actions"><button class="secondary" id="btn-restart">Start over</button></div>
     </section>
   `);
 
+  const boardView = view.querySelector('#board-view');
+  const tracesCanvas = bitmapToCanvas(images.traces);
   tracesCanvas.style.maxWidth = '100%';
-  view.querySelector('#board-view').appendChild(tracesCanvas);
+  boardView.appendChild(tracesCanvas);
 
   const meta = view.querySelector('#match-meta');
   if (unavailable) {
     meta.innerHTML = `<span class="badge warn">Footprint not available</span> The uploaded board has no "${footprintId.split(':').pop()}" footprint anywhere on it, so there's nothing to search for. This tool can currently only match footprints that already exist somewhere on the board — try a different component, or a board more likely to include this part.`;
-  } else if (matches.length === 0) {
+  } else if (matchCount === 0) {
     meta.innerHTML = '<span class="badge warn">No match found</span> Try a different component or double-check the uploaded board.';
   } else {
-    const best = matches[0];
     meta.innerHTML = `<span class="badge ok">Best match</span> score ${(best.score * 100).toFixed(1)}% · orientation ${best.orientation}&deg; · side ${best.fb} · at (${best.coordinates.x}, ${best.coordinates.y})`;
-
-    const overlay = cm.getTransparentOverlay(best);
-    const overlayCanvas = document.createElement('canvas');
-    overlayCanvas.className = 'overlay';
-    cv.imshow(overlayCanvas, overlay); // cv.imshow sizes the canvas to match the Mat itself
-    view.querySelector('#board-view').appendChild(overlayCanvas);
+    if (images.overlay) boardView.appendChild(bitmapToCanvas(images.overlay, 'overlay'));
   }
 
   view.querySelector('#btn-restart').addEventListener('click', () => renderUploadView());
@@ -330,31 +274,20 @@ function renderComponentResultView(ref, matches, cm, tracesCanvas, { unavailable
 
 async function runCircuitMatchFlow() {
   try {
-    await waitForOpenCv();
     const loading = renderLoadingView('Running circuit match…');
-    loading.setStatus('Parsing board and schematic…');
-
-    const { board, pcbBoard, tracesCanvas } = await prepareBoard();
-    const schematic = parseSchematic(session.schText);
-    const netArr = deriveNets(schematic).map((n) => ({ name: n.name, 'node arr': n['node arr'] }));
-    const { refArrSorted, footprintDict } = getOrderedComponentsList(schematic);
-    const footprintLookup = makeFootprintLookup(board);
-
-    loading.setStatus(`Searching for a circuit match across ${netArr.length} nets, ${refArrSorted.length} components…`);
-
-    const cirM = new CircuitMatching(refArrSorted, footprintDict, netArr);
-    cirM.pcbBoard = pcbBoard;
-
-    const result = await cirM.findCircuitMatch(footprintLookup, { onProgress: (p) => loading.onProgress(p) });
-
-    renderCircuitResultView(result, cirM, tracesCanvas);
+    const { data, images } = await runInWorker(
+      'circuitMatch',
+      { pcbText: session.pcbText, schText: session.schText, drlText: session.drlText },
+      { onStatus: (t) => loading.setStatus(t), onProgress: (p) => loading.onProgress(p) },
+    );
+    renderCircuitResultView(data, images);
   } catch (err) {
     renderErrorView(err);
   }
 }
 
-function renderCircuitResultView(match, cirM, tracesCanvas) {
-  const { totalNets, satisfiedNets, netsNeedingIntervention, unmatchableComponents, incompleteComponents, searchTimedOut, compatibilityPercent } = match.compatibility;
+function renderCircuitResultView(data, images) {
+  const { totalNets, satisfiedNets, netsNeedingIntervention, unmatchableComponents, incompleteComponents, searchTimedOut, compatibilityPercent } = data.compatibility;
   const complete = compatibilityPercent === 100;
 
   const view = el(`
@@ -397,26 +330,18 @@ function renderCircuitResultView(match, cirM, tracesCanvas) {
       `<div class="result-meta"><span class="badge warn">Missing footprints</span> the board has no matching footprint for: ${list}.</div>`;
   }
 
+  const boardView = view.querySelector('#board-view');
+  const tracesCanvas = bitmapToCanvas(images.traces);
   tracesCanvas.style.maxWidth = '100%';
-  view.querySelector('#board-view').appendChild(tracesCanvas);
-
-  if (match.circuitArr.length > 0) {
-    const overlays = cirM.getTransparentOverlay(match.circuitArr);
-    const overlayFront = Array.isArray(overlays) ? overlays[0] : overlays;
-    const overlayCanvas = document.createElement('canvas');
-    overlayCanvas.className = 'overlay';
-    overlayCanvas.width = tracesCanvas.width;
-    overlayCanvas.height = tracesCanvas.height;
-    cv.imshow(overlayCanvas, overlayFront);
-    view.querySelector('#board-view').appendChild(overlayCanvas);
-  }
+  boardView.appendChild(tracesCanvas);
+  if (images.overlay) boardView.appendChild(bitmapToCanvas(images.overlay, 'overlay'));
 
   const netList = view.querySelector('#net-list');
-  for (const net of match.circuitArr) {
-    const nodesText = net.nodes.length > 0 ? net.nodes.map((n) => n.node).join(', ') : '(no board location found for this net)';
-    const badge = net.incomplete && !net.interventions
+  for (const net of data.nets) {
+    const nodesText = net.nodes.length > 0 ? net.nodes.join(', ') : '(no board location found for this net)';
+    const badge = net.incomplete && !net.hasInterventions
       ? ' <span class="badge warn">unmatched</span>'
-      : net.interventions
+      : net.hasInterventions
         ? ' <span class="badge warn">needs added wire</span>'
         : '';
     const row = el(`

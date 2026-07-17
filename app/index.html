@@ -13,14 +13,8 @@
 
 <main id="view-root" class="view-root"></main>
 
-<script>
-  // opencv.js's WASM runtime finishes initializing asynchronously after the script tag loads;
-  // app.js awaits window.cvReadyPromise before touching any cv.* call.
-  window.cvReadyPromise = new Promise((resolve) => {
-    window.Module = { onRuntimeInitialized: resolve };
-  });
-</script>
-<script src="lib/opencv.js"></script>
+<!-- opencv.js is loaded inside worker.js (the matching pipeline runs entirely in a Web Worker);
+     the main page stays lightweight and interactive immediately. -->
 <script type="module" src="app.js"></script>
 </body>
 </html>

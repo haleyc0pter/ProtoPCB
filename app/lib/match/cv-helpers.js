@@ -19,7 +19,9 @@ export function yieldToUI() {
 // cv.imread requires the element to be attached to the DOM (some opencv.js builds look it up by
 // id). Renderer output is an in-memory, unattached <canvas>, so read its pixels directly instead.
 export function matFromImageSource(imgOrCanvas) {
-  if (imgOrCanvas instanceof HTMLCanvasElement) {
+  const isDomCanvas = typeof HTMLCanvasElement !== 'undefined' && imgOrCanvas instanceof HTMLCanvasElement;
+  const isOffscreen = typeof OffscreenCanvas !== 'undefined' && imgOrCanvas instanceof OffscreenCanvas;
+  if (isDomCanvas || isOffscreen) {
     const ctx = imgOrCanvas.getContext('2d');
     const imageData = ctx.getImageData(0, 0, imgOrCanvas.width, imgOrCanvas.height);
     return cv.matFromImageData(imageData);
