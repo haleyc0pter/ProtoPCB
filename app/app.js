@@ -2,21 +2,26 @@
 // view layer: render a screen, wire up its events, move to the next screen. The matching pipeline
 // (parsing, rendering, opencv.js) runs entirely inside worker.js — the main thread never loads
 // opencv.js, and background-tab timer throttling can't stretch a running search.
-import { parseSchematic, getOrderedComponentsList } from './lib/kicad/schematic.js';
+import { parseSchematic, getOrderedComponentsList, pickRootSheet } from './lib/kicad/schematic.js';
 
 const root = document.getElementById('view-root');
 
 const session = {
   pcbText: null,
   pcbFileName: '',
-  schText: null,
-  schFileName: '',
+  schFiles: [], // [{name, text}] — several files for hierarchical (multi-sheet) designs
   drlText: null,
   drlFileName: '',
   // Doubles on every "Search longer" click; the worker keeps its candidate caches between runs
   // of the same files, so each re-run continues where the previous one was cut off.
   circuitBudgetMs: 240000,
 };
+
+function parseSessionSchematic() {
+  const rootFile = pickRootSheet(session.schFiles);
+  const extraSheets = Object.fromEntries(session.schFiles.filter((f) => f !== rootFile).map((f) => [f.name, f.text]));
+  return parseSchematic(rootFile.text, { extraSheets });
+}
 
 // --- worker client -----------------------------------------------------------------------------
 
@@ -87,8 +92,8 @@ function renderUploadView() {
       </div>
 
       <div class="field">
-        <label for="sch-file">Target schematic (.kicad_sch)</label>
-        <input type="file" id="sch-file" accept=".kicad_sch" />
+        <label for="sch-file">Target schematic (.kicad_sch) — select all sheets for hierarchical designs</label>
+        <input type="file" id="sch-file" accept=".kicad_sch" multiple />
         <div class="file-name" id="sch-file-name"></div>
       </div>
 
@@ -112,7 +117,7 @@ function renderUploadView() {
   const btnCircuit = view.querySelector('#btn-circuit-match');
 
   const updateButtons = () => {
-    const ready = !!session.pcbText && !!session.schText;
+    const ready = !!session.pcbText && session.schFiles.length > 0;
     btnComponent.disabled = !ready;
     btnCircuit.disabled = !ready;
   };
@@ -127,11 +132,10 @@ function renderUploadView() {
   });
 
   schInput.addEventListener('change', async () => {
-    const file = schInput.files[0];
-    if (!file) return;
-    session.schText = await file.text();
-    session.schFileName = file.name;
-    view.querySelector('#sch-file-name').textContent = file.name;
+    const files = [...schInput.files];
+    if (files.length === 0) return;
+    session.schFiles = await Promise.all(files.map(async (f) => ({ name: f.name, text: await f.text() })));
+    view.querySelector('#sch-file-name').textContent = files.map((f) => f.name).join(', ');
     updateButtons();
   });
 
@@ -198,7 +202,7 @@ function renderErrorView(err) {
 function runComponentSelectorFlow() {
   try {
     // Pure text parsing — fast enough to stay on the main thread.
-    const schematic = parseSchematic(session.schText);
+    const schematic = parseSessionSchematic();
     const { refArrSorted } = getOrderedComponentsList(schematic);
 
     const view = el(`
@@ -282,7 +286,7 @@ async function runCircuitMatchFlow({ searchLonger = false } = {}) {
     const loading = renderLoadingView(searchLonger ? 'Searching further…' : 'Running circuit match…');
     const { data, images } = await runInWorker(
       'circuitMatch',
-      { pcbText: session.pcbText, schText: session.schText, drlText: session.drlText, searchBudgetMs: session.circuitBudgetMs },
+      { pcbText: session.pcbText, schFiles: session.schFiles, drlText: session.drlText, searchBudgetMs: session.circuitBudgetMs },
       { onStatus: (t) => loading.setStatus(t), onProgress: (p) => loading.onProgress(p) },
     );
     renderCircuitResultView(data, images);

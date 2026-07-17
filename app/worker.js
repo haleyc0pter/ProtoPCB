@@ -5,7 +5,7 @@
 //
 // Protocol (all messages carry the request `id` they belong to):
 //   in:  { id, type: 'componentMatch', pcbText, drlText, ref, footprintId }
-//        { id, type: 'circuitMatch',  pcbText, schText, drlText }
+//        { id, type: 'circuitMatch',  pcbText, schFiles: [{name, text}], drlText }
 //   out: { id, type: 'status',   text }
 //        { id, type: 'progress', p }                   — same shape onProgress produced before
 //        { id, type: 'result',   data, images }        — plain JSON + ImageBitmaps (transferred)
@@ -13,7 +13,7 @@
 import { parseBoard, isBoardDoubleSided } from './lib/kicad/board.js';
 import { renderLayer, renderFootprint } from './lib/kicad/renderer.js';
 import { parseDrillFile } from './lib/kicad/drill.js';
-import { parseSchematic, deriveNets, getOrderedComponentsList } from './lib/kicad/schematic.js';
+import { parseSchematic, deriveNets, getOrderedComponentsList, pickRootSheet } from './lib/kicad/schematic.js';
 import { PCBBoard } from './lib/match/pcb-board.js';
 import { ComponentMatching } from './lib/match/component-match.js';
 import { CircuitMatching } from './lib/match/circuit-matching.js';
@@ -192,9 +192,17 @@ async function handleComponentMatch({ id, pcbText, drlText, ref, footprintId }) 
   postMessage({ id, type: 'result', data, images }, transfers);
 }
 
-async function handleCircuitMatch({ id, pcbText, schText, drlText, searchBudgetMs }) {
+// `schFiles` is every uploaded schematic file; hierarchical designs are flattened from the root
+// sheet with the rest available as sub-sheets (see schematic.js).
+function parseSchematicFiles(schFiles) {
+  const root = pickRootSheet(schFiles);
+  const extraSheets = Object.fromEntries(schFiles.filter((f) => f !== root).map((f) => [f.name, f.text]));
+  return parseSchematic(root.text, { extraSheets });
+}
+
+async function handleCircuitMatch({ id, pcbText, schFiles, drlText, searchBudgetMs }) {
   const status = (text) => postMessage({ id, type: 'status', text });
-  const key = textKey(pcbText, schText, drlText);
+  const key = textKey(pcbText, ...schFiles.map((f) => f.text), drlText);
 
   let cirM, footprintLookup, netArr, refArrSorted, tracesBitmap;
   if (circuitSession && circuitSession.key === key) {
@@ -211,7 +219,7 @@ async function handleCircuitMatch({ id, pcbText, schText, drlText, searchBudgetM
     const { board, pcbBoard, tracesCanvas } = prepareBoard(pcbText, drlText);
     tracesBitmap = tracesCanvas.transferToImageBitmap();
 
-    const schematic = parseSchematic(schText);
+    const schematic = parseSchematicFiles(schFiles);
     netArr = deriveNets(schematic).map((n) => ({ name: n.name, 'node arr': n['node arr'] }));
     const parsed = getOrderedComponentsList(schematic);
     refArrSorted = parsed.refArrSorted;
